@@ -1,92 +1,97 @@
-use reqwest::Client;
-use serde_json::json;
-use dotenv::dotenv;
 use std::env;
 use std::fs;
-use std::error::Error;
+use dotenv::dotenv;
+use tokio;
+use futures::future::join_all;
 
-fn parse_repo_url(url: &str) -> Option<(String, String)> {
-    let parts: Vec<&str> = url.split('/').collect();
-    if parts.len() >= 5 && parts[2] == "github.com" {
-        Some((parts[3].to_string(), parts[4].to_string()))
-    } else {
-        None
-    }
-}
+mod db;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     dotenv().ok();
-    let token = env::var("GITHUB_TOKEN").expect("GITHUB_TOKEN not set in .env file");
-    let client = Client::builder()
-        .user_agent("graphql-rust/0.1.0")
-        .build()?;
-   /*
-   name:仓库名字
-   stargazers:star数量
-   forks:fork数量
-   watchers:关注者数量
 
-    */
-    let query = r#"
-        query($owner: String!, $name: String!) {
-          repository(owner: $owner, name: $name) {
-            name
-            stargazers { totalCount }
-            forks { totalCount }
-            watchers { totalCount }
-            defaultBranchRef {
-              target {
-                ... on Commit {
-                  history(first: 100) {
-                    totalCount
-                    edges {
-                      node {
-                        committedDate
-                      }
+    let pg_client = db::connect_postgres().await?;
+    db::init_db(&pg_client).await?;
+
+    let pool = db::create_pool().await?;
+
+    let repos_content = fs::read_to_string("repos.txt")?;
+    let repos: Vec<&str> = repos_content.lines().collect();
+
+    let mut handles = Vec::new();
+    for repo in repos {
+        let repo = repo.trim();
+        let parts: Vec<&str> = repo.split('/').collect();
+        if parts.len() >= 4 && parts[0] == "https:" && parts[2] == "github.com" {
+            let owner = parts[3].to_string();
+            let name = parts[4].to_string();
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                let db_client = match pool.get().await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        eprintln!("Failed to get DB client for {}/{}: {}", owner, name, e);
+                        return;
                     }
-                  }
+                };
+                println!("Processing: {}/{}", owner, name);
+                match fetch_repo_data(&owner, &name).await {
+                    Ok(response) => {
+                        if let Err(e) = db::store_repo_data(&db_client, &owner, &name, response).await {
+                            eprintln!("Failed to store data for {}/{}: {}", owner, name, e);
+                        }
+                    }
+                    Err(e) => eprintln!("Failed to fetch data for {}/{}: {}", owner, name, e),
                 }
-              }
-            }
-            pullRequests(states: MERGED) { totalCount }
-            issues(states: CLOSED) { totalCount }
-          }
-        }
-    "#;
-
-    let contents = fs::read_to_string("repos.txt")?;
-    let repo_urls: Vec<&str> = contents.lines().collect();
-
-    for url in repo_urls {
-        if let Some((owner, name)) = parse_repo_url(url) {
-            println!("Processing: {}/{}", owner, name);
-
-            let variables = json!({
-                "owner": owner,
-                "name": name
-            });
-
-            let request_body = json!({
-                "query": query,
-                "variables": variables
-            });
-
-            let response = client
-                .post("https://api.github.com/graphql")
-                .bearer_auth(&token)
-                .json(&request_body)
-                .send()
-                .await?
-                .json::<serde_json::Value>()
-                .await?;
-
-            println!("Response: {}", serde_json::to_string_pretty(&response)?);
-            println!("---");
+            }));
         } else {
-            println!("Invalid URL: {}", url);
+            eprintln!("Invalid repo format: {}", repo);
         }
     }
 
+    join_all(handles).await;
+
+    println!("---");
     Ok(())
+}
+
+/// 从 GitHub API 获取仓库数据
+async fn fetch_repo_data(owner: &str, name: &str) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    let token = env::var("GITHUB_TOKEN")?;
+    let client = reqwest::Client::new();
+
+    let query = format!(
+        r#"query {{
+            repository(owner: "{}", name: "{}") {{
+                name
+                stargazers {{ totalCount }}
+                forks {{ totalCount }}
+                defaultBranchRef {{
+                    target {{
+                        ... on Commit {{
+                            history {{
+                                totalCount
+                            }}
+                        }}
+                    }}
+                }}
+                issues(states: CLOSED) {{ totalCount }}
+                pullRequests(states: MERGED) {{ totalCount }}
+            }}
+        }}"#,
+        owner, name
+    );
+
+    let request_body = serde_json::json!({ "query": query });
+    let response = client
+        .post("https://api.github.com/graphql")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", "get-data-test")
+        .json(&request_body)
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+
+    Ok(response)
 }
