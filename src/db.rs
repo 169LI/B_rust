@@ -41,17 +41,6 @@ pub async fn connect_postgres() -> Result<tokio_postgres::Client, tokio_postgres
     Ok(client)
 }
 
-pub async fn log_error(owner: &str, name: &str, error: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let log_dir = "error_logs";
-    fs::create_dir_all(log_dir)?;
-
-    let timestamp = Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string();
-    let filename = format!("{}/{}_{}_{}.log", log_dir, owner, name, timestamp);
-    let mut file = File::create(&filename)?;
-    writeln!(file, "Error at {}: {}", Utc::now().to_rfc3339(), error)?;
-    Ok(())
-}
-
 pub fn delete_error_log(owner: &str, name: &str) {
     let log_dir = "error_logs";
     if let Ok(entries) = fs::read_dir(log_dir) {
@@ -65,7 +54,36 @@ pub fn delete_error_log(owner: &str, name: &str) {
         }
     }
 }
+pub async fn log_error(owner: &str, name: &str, error: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let log_dir = "error_logs";
+    fs::create_dir_all(log_dir)?;
+    let timestamp = Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+    let filename = format!("{}/{}_{}_{}.log", log_dir, owner, name, timestamp);
+    let mut file = File::create(&filename)?;
+    writeln!(file, "Error at {}: {}", Utc::now().to_rfc3339(), error)?;
+    Ok(())
+}
 
+pub async fn log_token_ban(token: &str, owner: &str, name: &str, remaining_tokens: usize) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let log_dir = "token_ban_logs";
+    fs::create_dir_all(log_dir)?;
+    let timestamp = Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+    let filename = format!("{}/token_ban_{}_{}_{}.log", log_dir, owner, name, timestamp);
+    let mut file = File::create(&filename)?;
+    writeln!(file, "Token banned at {}: {}", Utc::now().to_rfc3339(), token)?;
+    writeln!(file, "Used for repository: {}/{}", owner, name)?;
+    writeln!(file, "Remaining available tokens: {}", remaining_tokens)?;
+    Ok(())
+}
+pub async fn log_invalid_format(repo: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let log_dir = "invalid_format_logs";
+    fs::create_dir_all(log_dir)?;
+    let timestamp = Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+    let filename = format!("{}/invalid_{}.log", log_dir, timestamp);
+    let mut file = File::create(&filename)?;
+    writeln!(file, "Invalid format at {}: {}", Utc::now().to_rfc3339(), repo)?;
+    Ok(())
+}
 pub async fn init_db(pg_client: &tokio_postgres::Client) -> Result<(), Box<dyn Error + Send + Sync>> {
     let password = env::var("DB_PASSWORD").expect("DB_PASSWORD not set");
     let create_user = format!("CREATE ROLE github_user WITH LOGIN PASSWORD '{}'", password);
