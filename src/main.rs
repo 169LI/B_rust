@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let pool = db::create_pool().await?;
 
-    let repos_content = fs::read_to_string("repos.txt")?;
+    let repos_content = fs::read_to_string("repositories.data")?;
     let repos: Vec<&str> = repos_content.lines().collect();
 
     let mut handles = Vec::new();
@@ -24,30 +24,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let parts: Vec<&str> = repo.split('/').collect();
         if parts.len() >= 4 && parts[0] == "https:" && parts[2] == "github.com" {
             let owner = parts[3].to_string();
-            // 提取 name 并移除可能的 .git 或其他后缀
-            let raw_name = parts[4];
-            let name = raw_name
-                .split('.')  // 以点分割，去掉 .git 或 .rs 等
-                .next()      // 取第一个部分
-                .unwrap_or(raw_name)  // 如果没有分割结果，用原始值
-                .to_string();
+            let name = parts[4].split('.').next().unwrap_or(parts[4]).to_string();
             let pool = pool.clone();
             handles.push(tokio::spawn(async move {
-                let db_client = match pool.get().await {
-                    Ok(client) => client,
-                    Err(e) => {
-                        eprintln!("Failed to get DB client for {}/{}: {}", owner, name, e);
-                        return;
-                    }
-                };
+                let db_client = pool.get().await.unwrap();
                 println!("Processing: {}/{}", owner, name);
-                match fetch_repo_data(&owner, &name).await {
-                    Ok(response) => {
-                        if let Err(e) = db::store_repo_data(&db_client, &owner, &name, response).await {
-                            eprintln!("Failed to store data for {}/{}: {}", owner, name, e);
+                loop {
+                    match fetch_repo_data(&owner, &name).await {
+                        Ok(response) => {
+                            if db::store_repo_data(&db_client, &owner, &name, response).await.is_ok() {
+                                db::delete_error_log(&owner, &name); // 成功后删除错误日志
+                                break; // 成功则退出循环
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error for {}/{}: {}", owner, name, e);
+                            db::log_error(&owner, &name, &e.to_string()).await.unwrap();
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await; // 等待5秒后重试
                         }
                     }
-                    Err(e) => eprintln!("Failed to fetch data for {}/{}: {}", owner, name, e),
                 }
             }));
         } else {
@@ -56,12 +51,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     join_all(handles).await;
-
-    println!("---");
     Ok(())
 }
 
-/// 从 GitHub API 获取仓库数据
 async fn fetch_repo_data(owner: &str, name: &str) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
     let token = env::var("GITHUB_TOKEN")?;
     let client = reqwest::Client::new();

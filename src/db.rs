@@ -6,7 +6,6 @@ use std::io::Write;
 use chrono::Utc;
 use std::error::Error;
 
-/// 创建 PostgreSQL 连接池
 pub async fn create_pool() -> Result<Pool, Box<dyn Error + Send + Sync>> {
     let mut cfg = Config::new();
     cfg.host = Some(env::var("DB_HOST").expect("DB_HOST not set"));
@@ -22,7 +21,6 @@ pub async fn create_pool() -> Result<Pool, Box<dyn Error + Send + Sync>> {
     Ok(pool)
 }
 
-/// 直接连接到 PostgreSQL 数据库
 pub async fn connect_postgres() -> Result<tokio_postgres::Client, tokio_postgres::Error> {
     let host = env::var("DB_HOST").expect("DB_HOST not set");
     let port = env::var("DB_PORT").expect("DB_PORT not set");
@@ -43,23 +41,31 @@ pub async fn connect_postgres() -> Result<tokio_postgres::Client, tokio_postgres
     Ok(client)
 }
 
-/// 记录 SQL 语句到日志文件
-fn log_sql(query: &str, context: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let log_dir = "sql_logs";
+pub async fn log_error(owner: &str, name: &str, error: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let log_dir = "error_logs";
     fs::create_dir_all(log_dir)?;
 
     let timestamp = Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string();
-    let filename = format!("{}/{}_{}.sql", log_dir, context, timestamp);
+    let filename = format!("{}/{}_{}_{}.log", log_dir, owner, name, timestamp);
     let mut file = File::create(&filename)?;
-
-    writeln!(file, "-- SQL executed at {}", Utc::now().to_rfc3339())?;
-    writeln!(file, "{}", query)?;
-    println!("Logged SQL to {}", filename);
-
+    writeln!(file, "Error at {}: {}", Utc::now().to_rfc3339(), error)?;
     Ok(())
 }
 
-/// 初始化数据库和表结构
+pub fn delete_error_log(owner: &str, name: &str) {
+    let log_dir = "error_logs";
+    if let Ok(entries) = fs::read_dir(log_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                if filename.starts_with(&format!("{}_{}", owner, name)) {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
+    }
+}
+
 pub async fn init_db(pg_client: &tokio_postgres::Client) -> Result<(), Box<dyn Error + Send + Sync>> {
     let password = env::var("DB_PASSWORD").expect("DB_PASSWORD not set");
     let create_user = format!("CREATE ROLE github_user WITH LOGIN PASSWORD '{}'", password);
@@ -68,7 +74,6 @@ pub async fn init_db(pg_client: &tokio_postgres::Client) -> Result<(), Box<dyn E
             return Err(Box::new(e));
         }
     }
-    log_sql(&create_user, "init_user")?;
 
     let create_db = "CREATE DATABASE github_db OWNER github_user";
     if let Err(e) = pg_client.execute(create_db, &[]).await {
@@ -76,17 +81,13 @@ pub async fn init_db(pg_client: &tokio_postgres::Client) -> Result<(), Box<dyn E
             return Err(Box::new(e));
         }
     }
-    log_sql(create_db, "init_db")?;
 
     let pool = create_pool().await?;
     let github_client = pool.get().await?;
 
-    // 删除旧表（如果存在）
     let drop_repositories = "DROP TABLE IF EXISTS repositories CASCADE";
     github_client.execute(drop_repositories, &[]).await?;
-    log_sql(drop_repositories, "drop_repositories")?;
 
-    // 创建新表
     let create_repositories = r#"
         CREATE TABLE IF NOT EXISTS repositories (
             id SERIAL PRIMARY KEY,
@@ -100,13 +101,10 @@ pub async fn init_db(pg_client: &tokio_postgres::Client) -> Result<(), Box<dyn E
             UNIQUE(owner, name)
         )"#;
     github_client.execute(create_repositories, &[]).await?;
-    log_sql(create_repositories, "init_repositories")?;
 
-    println!("Database and tables initialized");
     Ok(())
 }
 
-/// 存储仓库数据到数据库
 pub async fn store_repo_data(
     pg_client: &deadpool_postgres::Client,
     owner: &str,
@@ -135,14 +133,8 @@ pub async fn store_repo_data(
                 &[&owner, &name, &stars, &forks, &commits, &issues, &merged_prs],
             )
             .await?;
-        log_sql(query, &format!("{}_{}", owner, name))?;
-
-        println!("Stored data for {}/{}", owner, name);
-    } else if let Some(errors) = response.get("errors") {
-        println!("Error for {}/{}: {:?}", owner, name, errors);
+        Ok(())
     } else {
-        println!("No repository data for {}/{}", owner, name);
+        Err("No repository data or error in response".into())
     }
-
-    Ok(())
 }
