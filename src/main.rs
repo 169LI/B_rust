@@ -24,7 +24,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let parts: Vec<&str> = repo.split('/').collect();
         if parts.len() >= 4 && parts[0] == "https:" && parts[2] == "github.com" {
             let owner = parts[3].to_string();
-            let name = parts[4].to_string();
+            // 提取 name 并移除可能的 .git 或其他后缀
+            let raw_name = parts[4];
+            let name = raw_name
+                .split('.')  // 以点分割，去掉 .git 或 .rs 等
+                .next()      // 取第一个部分
+                .unwrap_or(raw_name)  // 如果没有分割结果，用原始值
+                .to_string();
             let pool = pool.clone();
             handles.push(tokio::spawn(async move {
                 let db_client = match pool.get().await {
