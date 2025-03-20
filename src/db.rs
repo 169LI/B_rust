@@ -13,6 +13,7 @@ pub async fn create_pool() -> Result<Pool, Box<dyn Error + Send + Sync>> {
     cfg.user = Some(env::var("DB_USER").expect("DB_USER not set"));
     cfg.password = Some(env::var("DB_PASSWORD").expect("DB_PASSWORD not set"));
     cfg.dbname = Some(env::var("DB_NAME").expect("DB_NAME not set"));
+    cfg.pool = Some(deadpool_postgres::PoolConfig::new(100)); //TODO设置为 100
     cfg.manager = Some(ManagerConfig {
         recycling_method: RecyclingMethod::Fast,
     });
@@ -41,19 +42,7 @@ pub async fn connect_postgres() -> Result<tokio_postgres::Client, tokio_postgres
     Ok(client)
 }
 
-pub fn delete_error_log(owner: &str, name: &str) {
-    let log_dir = "error_logs";
-    if let Ok(entries) = fs::read_dir(log_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                if filename.starts_with(&format!("{}_{}", owner, name)) {
-                    let _ = fs::remove_file(path);
-                }
-            }
-        }
-    }
-}
+
 pub async fn log_error(owner: &str, name: &str, error: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let log_dir = "error_logs";
     fs::create_dir_all(log_dir)?;
