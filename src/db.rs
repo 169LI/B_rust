@@ -1,30 +1,11 @@
 use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use tokio_postgres::NoTls;
 use std::env;
-use std::fs::{self, File};
-use std::io::Write;
-use chrono::Utc;
-use std::error::Error;
+use crate::errors::AppError;
 
-pub async fn create_pool() -> Result<Pool, Box<dyn Error + Send + Sync>> {
-    let mut cfg = Config::new();
-    cfg.host = Some(env::var("DB_HOST").expect("DB_HOST not set"));
-    cfg.port = Some(env::var("DB_PORT").expect("DB_PORT not set").parse()?);
-    cfg.user = Some(env::var("DB_USER").expect("DB_USER not set"));
-    cfg.password = Some(env::var("DB_PASSWORD").expect("DB_PASSWORD not set"));
-    cfg.dbname = Some(env::var("DB_NAME").expect("DB_NAME not set"));
-    cfg.pool = Some(deadpool_postgres::PoolConfig::new(100)); //TODO设置为 100
-    cfg.manager = Some(ManagerConfig {
-        recycling_method: RecyclingMethod::Fast,
-    });
-
-    let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
-    Ok(pool)
-}
-
-pub async fn connect_postgres() -> Result<tokio_postgres::Client, tokio_postgres::Error> {
-    let host = env::var("DB_HOST").expect("DB_HOST not set");
-    let port = env::var("DB_PORT").expect("DB_PORT not set");
+pub async fn connect_postgres() -> Result<tokio_postgres::Client, AppError> {
+    let host = env::var("DB_HOST").unwrap_or("localhost".to_string());
+    let port = env::var("DB_PORT").unwrap_or("5432".to_string());
     let password = env::var("POSTGRES_PASSWORD").expect("POSTGRES_PASSWORD not set");
 
     let conn_str = format!(
@@ -42,74 +23,92 @@ pub async fn connect_postgres() -> Result<tokio_postgres::Client, tokio_postgres
     Ok(client)
 }
 
+pub async fn init_db(pg_client: &mut tokio_postgres::Client) -> Result<(), AppError> {
+    if pg_client.is_closed() {
+        return Err(AppError::DatabaseError("数据库连接已关闭".to_string()));
+    }
 
-pub async fn log_error(owner: &str, name: &str, error: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let log_dir = "error_logs";
-    fs::create_dir_all(log_dir)?;
-    let timestamp = Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string();
-    let filename = format!("{}/{}_{}_{}.log", log_dir, owner, name, timestamp);
-    let mut file = File::create(&filename)?;
-    writeln!(file, "Error at {}: {}", Utc::now().to_rfc3339(), error)?;
-    Ok(())
-}
+    let db_exists = pg_client
+        .query_one("SELECT 1 FROM pg_database WHERE datname='github_db'", &[])
+        .await
+        .is_ok();
+    if !db_exists {
+        pg_client
+            .execute("CREATE DATABASE github_db", &[])
+            .await?;
+    }
 
-pub async fn log_token_ban(token: &str, owner: &str, name: &str, remaining_tokens: usize) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let log_dir = "token_ban_logs";
-    fs::create_dir_all(log_dir)?;
-    let timestamp = Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string();
-    let filename = format!("{}/token_ban_{}_{}_{}.log", log_dir, owner, name, timestamp);
-    let mut file = File::create(&filename)?;
-    writeln!(file, "Token banned at {}: {}", Utc::now().to_rfc3339(), token)?;
-    writeln!(file, "Used for repository: {}/{}", owner, name)?;
-    writeln!(file, "Remaining available tokens: {}", remaining_tokens)?;
-    Ok(())
-}
-pub async fn log_invalid_format(repo: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let log_dir = "invalid_format_logs";
-    fs::create_dir_all(log_dir)?;
-    let timestamp = Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string();
-    let filename = format!("{}/invalid_{}.log", log_dir, timestamp);
-    let mut file = File::create(&filename)?;
-    writeln!(file, "Invalid format at {}: {}", Utc::now().to_rfc3339(), repo)?;
-    Ok(())
-}
-pub async fn init_db(pg_client: &tokio_postgres::Client) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let password = env::var("DB_PASSWORD").expect("DB_PASSWORD not set");
-    let create_user = format!("CREATE ROLE github_user WITH LOGIN PASSWORD '{}'", password);
-    if let Err(e) = pg_client.execute(&create_user, &[]).await {
-        if !e.to_string().contains("already exists") {
-            return Err(Box::new(e));
+    let host = env::var("DB_HOST").unwrap_or("localhost".to_string());
+    let port = env::var("DB_PORT").unwrap_or("5432".to_string());
+    let password = env::var("POSTGRES_PASSWORD").expect("POSTGRES_PASSWORD not set");
+    let conn_str = format!(
+        "host={} port={} user=postgres password={} dbname=github_db",
+        host, port, password
+    );
+    let (pg_client, connection) = tokio_postgres::connect(&conn_str, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Database connection error: {}", e);
+        }
+    });
+
+    let table_exists = pg_client
+        .query_one(
+            "SELECT 1 FROM information_schema.tables WHERE table_name='repositories'",
+            &[],
+        )
+        .await
+        .is_ok();
+    if table_exists {
+        let column_type = pg_client
+            .query_one(
+                "SELECT data_type FROM information_schema.columns WHERE table_name='repositories' AND column_name='stars'",
+                &[],
+            )
+            .await?;
+        if column_type.get::<_, String>(0) != "bigint" {
+            pg_client.execute("DROP TABLE repositories", &[]).await?;
+        } else {
+            return Ok(());
         }
     }
 
-    let create_db = "CREATE DATABASE github_db OWNER github_user";
-    if let Err(e) = pg_client.execute(create_db, &[]).await {
-        if !e.to_string().contains("already exists") {
-            return Err(Box::new(e));
-        }
-    }
-
-    let pool = create_pool().await?;
-    let github_client = pool.get().await?;
-
-    let drop_repositories = "DROP TABLE IF EXISTS repositories CASCADE";
-    github_client.execute(drop_repositories, &[]).await?;
-
-    let create_repositories = r#"
-        CREATE TABLE IF NOT EXISTS repositories (
-            id SERIAL PRIMARY KEY,
-            owner VARCHAR(255) NOT NULL,
-            name VARCHAR(255) NOT NULL,
-            stars INTEGER NOT NULL,
-            forks INTEGER NOT NULL,
-            commits INTEGER NOT NULL,
-            issues INTEGER NOT NULL,
-            merged_prs INTEGER NOT NULL,
-            UNIQUE(owner, name)
-        )"#;
-    github_client.execute(create_repositories, &[]).await?;
+    pg_client
+        .execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS repositories (
+                id SERIAL PRIMARY KEY,
+                owner VARCHAR(255) NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                stars BIGINT NOT NULL,
+                forks BIGINT NOT NULL,
+                commits BIGINT NOT NULL,
+                issues BIGINT NOT NULL,
+                merged_prs BIGINT NOT NULL,
+                UNIQUE(owner, name)
+            )
+            "#,
+            &[],
+        )
+        .await?;
 
     Ok(())
+}
+
+pub async fn create_pool() -> Result<Pool, AppError> {
+    let mut cfg = Config::new();
+    cfg.host = Some(env::var("DB_HOST").unwrap_or("localhost".to_string()));
+    cfg.port = Some(env::var("DB_PORT").unwrap_or("5432".to_string()).parse()?);
+    cfg.user = Some(env::var("DB_USER").unwrap_or("postgres".to_string()));
+    cfg.password = Some(env::var("DB_PASSWORD").unwrap_or("github@123".to_string()));
+    cfg.dbname = Some(env::var("DB_NAME").unwrap_or("github_db".to_string()));
+    cfg.pool = Some(deadpool_postgres::PoolConfig::new(100));
+    cfg.manager = Some(ManagerConfig {
+        recycling_method: RecyclingMethod::Fast,
+    });
+
+    let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
+    Ok(pool)
 }
 
 pub async fn store_repo_data(
@@ -117,15 +116,15 @@ pub async fn store_repo_data(
     owner: &str,
     name: &str,
     response: serde_json::Value,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<(), AppError> {
     if let Some(repo) = response.get("data").and_then(|d| d.get("repository")) {
-        let stars = repo["stargazers"]["totalCount"].as_i64().unwrap_or(0) as i32;
-        let forks = repo["forks"]["totalCount"].as_i64().unwrap_or(0) as i32;
+        let stars = repo["stargazers"]["totalCount"].as_i64().unwrap_or(0);
+        let forks = repo["forks"]["totalCount"].as_i64().unwrap_or(0);
         let commits = repo["defaultBranchRef"]["target"]["history"]["totalCount"]
             .as_i64()
-            .unwrap_or(0) as i32;
-        let issues = repo["issues"]["totalCount"].as_i64().unwrap_or(0) as i32;
-        let merged_prs = repo["pullRequests"]["totalCount"].as_i64().unwrap_or(0) as i32;
+            .unwrap_or(0);
+        let issues = repo["issues"]["totalCount"].as_i64().unwrap_or(0);
+        let merged_prs = repo["pullRequests"]["totalCount"].as_i64().unwrap_or(0);
 
         let query = r#"
             INSERT INTO repositories (owner, name, stars, forks, commits, issues, merged_prs)
@@ -142,6 +141,6 @@ pub async fn store_repo_data(
             .await?;
         Ok(())
     } else {
-        Err("No repository data or error in response".into())
+        Err(AppError::ApiError("API响应中没有仓库数据".to_string()))
     }
 }
