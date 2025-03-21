@@ -18,7 +18,7 @@ pub fn log_error(err: &AppError) {
         AppError::ConfigError(_) => "logs/config_errors.log",
         AppError::FileError(_) => "logs/file_errors.log",
         AppError::TimeoutError(_) => "logs/timeout_errors.log",
-        AppError::InvalidFormat(_) => "logs/invalid_format.log", // 新增
+        AppError::InvalidFormat(_) => "logs/invalid_format.log",
     };
 
     let mut file = OpenOptions::new()
@@ -35,7 +35,7 @@ pub fn log_error(err: &AppError) {
         AppError::ConfigError(msg) => format!("错误类型: 配置错误 | 库: 无 | 详情: {} | 时间: {}\n", msg, time),
         AppError::FileError(msg) => format!("错误类型: 文件错误 | 库: 无 | 详情: {} | 时间: {}\n", msg, time),
         AppError::TimeoutError(msg) => format!("错误类型: 超时错误 | 库: 无 | 详情: {} | 时间: {}\n", msg, time),
-        AppError::InvalidFormat(msg) => format!("错误类型: 格式错误 | 库: 无 | 详情: {} | 时间: {}\n", msg, time), // 新增
+        AppError::InvalidFormat(msg) => format!("错误类型: 格式错误 | 库: 无 | 详情: {} | 时间: {}\n", msg, time),
     };
 
     file.write_all(log_entry.as_bytes()).expect("无法写入日志");

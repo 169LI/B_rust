@@ -1,15 +1,35 @@
 use std::fmt;
 use deadpool_postgres::CreatePoolError;
+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum AppError {
-    DatabaseError(String),  // 数据库相关错误
-    ConfigError(String),    // 配置相关错误
-    FileError(String),      // 文件相关错误
-    ApiError(String),       // API 相关错误
-    TimeoutError(String),   // 超时错误
-    TokenBanned(String),    // Token 被禁用错误
-    InvalidFormat(String),  // 无效格式错误（新增）
+    DatabaseError(String),
+    ConfigError(String),
+    FileError(String),
+    ApiError(String),
+    TimeoutError(String),
+    TokenBanned(String),
+    InvalidFormat(String),
+}
+
+impl AppError {
+    pub fn retry_after(&self) -> Option<u64> {
+        match self {
+            AppError::ApiError(msg) => {
+                if msg.contains("速率限制，需等待") {
+                    msg.split_whitespace().nth(2).and_then(|s| s.parse::<u64>().ok())
+                } else if msg.contains("主要速率限制，需等待") {
+                    msg.split_whitespace().nth(2).and_then(|s| s.parse::<u64>().ok())
+                } else if msg.contains("次要速率限制") {
+                    Some(60) // 默认 1 分钟
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for AppError {
@@ -21,14 +41,13 @@ impl fmt::Display for AppError {
             AppError::ApiError(msg) => write!(f, "API错误: {}", msg),
             AppError::TimeoutError(msg) => write!(f, "超时错误: {}", msg),
             AppError::TokenBanned(msg) => write!(f, "Token被禁用: {}", msg),
-            AppError::InvalidFormat(msg) => write!(f, "格式错误: {}", msg), // 新增
+            AppError::InvalidFormat(msg) => write!(f, "格式错误: {}", msg),
         }
     }
 }
 
 impl std::error::Error for AppError {}
 
-// 实现 From traits
 impl From<std::num::ParseIntError> for AppError {
     fn from(err: std::num::ParseIntError) -> Self {
         AppError::ConfigError(format!("解析错误: {}", err))
