@@ -20,11 +20,11 @@ mod logger;
 // 全局配置
 #[allow(dead_code)]
 struct Config {
-    concurrency: usize,
-    max_db_retries: u32,
-    db_retry_interval: u64,
-    request_timeout: u64,
-    tokens: Vec<String>,
+    concurrency: usize,        // 并发请求数
+    max_db_retries: u32,      // 数据库连接最大重试次数
+    db_retry_interval: u64,   // 数据库重试间隔（秒）
+    request_timeout: u64,     // 请求超时时间（秒）
+    tokens: Vec<String>,      // GitHub Token 列表
 }
 
 impl Config {
