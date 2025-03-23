@@ -13,11 +13,11 @@ use rand::Rng;
 use crate::errors::AppError;
 use crate::logger::{log_error, log_stats};
 
-mod db;
-mod errors;
-mod logger;
+mod db; //数据库（连接、初始化、存储数据）
+mod errors;//自定义错误类型
+mod logger;//日志记录功能
 
-// 全局配置
+/// 配置管理(config结构体)
 #[allow(dead_code)]
 struct Config {
     concurrency: usize,        // 并发请求数
@@ -25,42 +25,66 @@ struct Config {
     db_retry_interval: u64,   // 数据库重试间隔（秒）
     request_timeout: u64,     // 请求超时时间（秒）
     tokens: Vec<String>,      // GitHub Token 列表
-}
 
+}
 impl Config {
     fn new() -> Self {
         Config {
+            //TODO Problem 需测试.unwrap_or()语法的参数要和上面的result的OK()一样？
             concurrency: env::var("CONCURRENCY")
-                .unwrap_or("50".to_string())
+                .unwrap_or_else(|_| {
+                    eprintln!("警告：环境变量 CONCURRENCY 未设置，将使用默认值 50");
+                    "50".to_string()
+                })
                 .parse()
                 .unwrap_or(50),
             max_db_retries: env::var("MAX_DB_RETRIES")
-                .unwrap_or("5".to_string())
+                .unwrap_or_else(|_| {
+                    eprintln!("警告：环境变量 MAX_DB_RETRIES 未设置，将使用默认值 5");
+                    "5".to_string()
+                })
                 .parse()
                 .unwrap_or(5),
             db_retry_interval: env::var("DB_RETRY_INTERVAL")
-                .unwrap_or("5".to_string())
+                .unwrap_or_else(|_| {
+                    eprintln!("警告：环境变量 DB_RETRY_INTERVAL 未设置，将使用默认值 5");
+                    "5".to_string()
+                })
                 .parse()
                 .unwrap_or(5),
             request_timeout: env::var("REQUEST_TIMEOUT")
-                .unwrap_or("30".to_string())
+                .unwrap_or_else(|_| {
+                    eprintln!("警告：环境变量 REQUEST_TIMEOUT 未设置，将使用默认值 5");
+                    "5".to_string()
+                })
                 .parse()
-                .unwrap_or(30),
+                .unwrap_or(5),
             tokens: vec![
                 env::var("GITHUB_TOKEN_1").expect("GITHUB_TOKEN_1 not set"),
                 env::var("GITHUB_TOKEN_2").expect("GITHUB_TOKEN_2 not set"),
                 env::var("GITHUB_TOKEN_3").expect("GITHUB_TOKEN_3 not set"),
-                env::var("GITHUB_TOKEN_4").expect("GITHUB_TOKEN_4 not set"),
+                //TODO Problem2 对于程序运行中的限速的Token采取什么方式处理 对于17w的数据 给足够的40Token一次性拿？
+                // 需要测试5000/小时 是如何计算的？0-10min把Token用完了，10-20会恢复吗
+                // 如果40Token->程序一小时（3000/分速率  18w/小时数据），直接对于限速的Token直接弃用
+
+                // env::var("GITHUB_TOKEN_4").expect("GITHUB_TOKEN_4 not set"),
                 env::var("GITHUB_TOKEN_5").expect("GITHUB_TOKEN_5 NOT set"),
                 env::var("GITHUB_TOKEN_6").expect("GITHUB_TOKEN_6 NOT set"),
                 env::var("GITHUB_TOKEN_7").expect("GITHUB_TOKEN_7 NOT set"),
                 env::var("GITHUB_TOKEN_8").expect("GITHUB_TOKEN_8 NOT set"),
                 env::var("GITHUB_TOKEN_9").expect("GITHUB_TOKEN_9 NOT set"),
+                env::var("GITHUB_TOKEN_10").expect("GITHUB_TOKEN_10 NOT set"),
+                env::var("GITHUB_TOKEN_11").expect("GITHUB_TOKEN_11 NOT set"),
             ].into_iter().filter(|t| !t.is_empty()).collect(),
         }
     }
 }
 
+///检查数据格式  返回(owner,name)
+///
+///格式http://github.com/owner/name 或https://github.com/owner/name.git
+///
+///name不合规则的返回AppError::InvalidFormat
 pub fn validate_repo_format(repo: &str) -> Result<(String, String), AppError> {
     let parts: Vec<&str> = repo.split('/').collect();
     let owner = parts[3].to_string();
@@ -68,27 +92,32 @@ pub fn validate_repo_format(repo: &str) -> Result<(String, String), AppError> {
     if (parts[0]!="https:" && parts[0]!="http:")||parts.len() < 5|| owner.is_empty() || name_raw.is_empty() {
         return Err(AppError::InvalidFormat(format!("无效的仓库格式: {}", repo)));
     }
+    //进一步处理name格式问题
     let name = name_raw.split('.').next().unwrap_or(name_raw).to_string();
     if name.is_empty() {
-        return Err(AppError::InvalidFormat(format!("仓库名称为空: {}", repo)));
+        return Err(AppError::InvalidFormat(format!("仓库名称格式错误: {}", repo)));
     }
     Ok((owner, name))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
-    dotenv().ok();
-    let config = Config::new();
+    //初始化日志
     logger::init_logger();
 
+    //加载配置
+    dotenv().map_err(|e| AppError::ConfigError(format!("无法加载 .env 文件: {}", e)))?;
+    let config = Config::new();
+
+    //共享状态初始化
     let tokens = Arc::new(config.tokens);
     let available_tokens = Arc::new(tokio::sync::Mutex::new(tokens.len()));
     let success_count = Arc::new(AtomicUsize::new(0));
     let banned_tokens = Arc::new(tokio::sync::Mutex::new(HashMap::<String, Instant>::new()));
 
+    //数据库初始化 连接、初始化，创建连接池
     let mut pg_client = db::connect_postgres().await?;
     db::init_db(&mut pg_client).await?;
-
     let pool = db::create_pool().await?;
 
     let repos_content = fs::read_to_string("repositories.data")?;
@@ -332,8 +361,6 @@ mod tests {
         }
         println!("所有仓库地址格式检查通过");
     }
-
-
     #[tokio::test]
     async fn test_database_connection() {
         dotenv::dotenv().ok();

@@ -2,24 +2,22 @@ use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use tokio_postgres::NoTls;
 use std::env;
 use crate::errors::AppError;
-
+use crate::logger::log_error;
 pub async fn connect_postgres() -> Result<tokio_postgres::Client, AppError> {
-    let host = env::var("DB_HOST").unwrap_or("localhost".to_string());
-    let port = env::var("DB_PORT").unwrap_or("5432".to_string());
+    let host = env::var("DB_HOST").expect("DB_HOST not set");
+    let port = env::var("DB_PORT").expect("DB_PORT not set");
+    let user = env::var("DB_USER").expect("DB_USER not set");
     let password = env::var("POSTGRES_PASSWORD").expect("POSTGRES_PASSWORD not set");
-
     let conn_str = format!(
-        "host={} port={} user=postgres password={}",
-        host, port, password
+        "host={} port={} user={} password={}",
+        host, port,user, password
     );
-
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("Initial database connection error: {}", e);
+            log_error(&AppError::DatabaseError(format!("数据库已断开连接: {}", e)));
         }
     });
-
     Ok(client)
 }
 

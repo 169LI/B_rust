@@ -13,6 +13,7 @@ pub enum AppError {
     InvalidFormat(String),
 }
 
+
 impl AppError {
     pub fn retry_after(&self) -> Option<u64> {
         match self {

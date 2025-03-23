@@ -19,6 +19,8 @@ pub fn log_error(err: &AppError) {
         AppError::FileError(_) => "logs/file_errors.log",
         AppError::TimeoutError(_) => "logs/timeout_errors.log",
         AppError::InvalidFormat(_) => "logs/invalid_format.log",
+
+
     };
 
     let mut file = OpenOptions::new()
@@ -29,7 +31,7 @@ pub fn log_error(err: &AppError) {
 
     let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let log_entry = match err {
-        AppError::DatabaseError(msg) => format!("错误类型: 数据库错误 | 库: tokio_postgres | 详情: {} | 时间: {}\n", msg, time),
+        AppError::DatabaseError(msg) => format!("{} | 错误类型: 数据库错误 | 详情: {} \n", time,msg),
         AppError::ApiError(msg) => format!("错误类型: API错误 | 库: reqwest | 详情: {} | 时间: {}\n", msg, time),
         AppError::TokenBanned(msg) => format!("错误类型: Token被禁用 | 库: 无 | 详情: {} | 时间: {}\n", msg, time),
         AppError::ConfigError(msg) => format!("错误类型: 配置错误 | 库: 无 | 详情: {} | 时间: {}\n", msg, time),

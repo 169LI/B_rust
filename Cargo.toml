@@ -2,10 +2,7 @@
 name = "get-data-test"
 version = "0.1.0"
 edition = "2024"
-authors = ["Your Name <2793140536@qq.com>"]
 description = "A simple Rust program to fetch data from GitHub API and store it in a PostgreSQL database"
-license = "MIT"
-keywords = ["rust", "github", "api", "database", "postgres"]
 
 
 
