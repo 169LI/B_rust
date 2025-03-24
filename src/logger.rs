@@ -32,12 +32,12 @@ pub fn log_error(err: &AppError) {
     let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let log_entry = match err {
         AppError::DatabaseError(msg) => format!("{} | 错误类型: 数据库错误 | 详情: {} \n", time,msg),
-        AppError::ApiError(msg) => format!("错误类型: API错误 | 库: reqwest | 详情: {} | 时间: {}\n", msg, time),
-        AppError::TokenBanned(msg) => format!("错误类型: Token被禁用 | 库: 无 | 详情: {} | 时间: {}\n", msg, time),
-        AppError::ConfigError(msg) => format!("错误类型: 配置错误 | 库: 无 | 详情: {} | 时间: {}\n", msg, time),
-        AppError::FileError(msg) => format!("错误类型: 文件错误 | 库: 无 | 详情: {} | 时间: {}\n", msg, time),
-        AppError::TimeoutError(msg) => format!("错误类型: 超时错误 | 库: 无 | 详情: {} | 时间: {}\n", msg, time),
-        AppError::InvalidFormat(msg) => format!("错误类型: 格式错误 | 库: 无 | 详情: {} | 时间: {}\n", msg, time),
+        AppError::ApiError(msg) => format!("{} | 错误类型: API请求错误 | 详情: {}\n", time, msg),
+        AppError::TokenBanned(msg) => format!("{} | 错误类型: Token被禁用 | 详情: {}\n", time, msg),
+        AppError::ConfigError(msg) => format!("{} | 错误类型: 配置错误 | 详情: {}\n", time, msg),
+        AppError::FileError(msg) => format!("{} | 错误类型: 文件错误 | 详情: {}\n", time, msg),
+        AppError::TimeoutError(msg) => format!("{} | 错误类型: 超时错误 | 详情: {}\n", time, msg),
+        AppError::InvalidFormat(msg) => format!("{} | 错误类型: 格式错误 | 详情: {}\n", time, msg),
     };
 
     file.write_all(log_entry.as_bytes()).expect("无法写入日志");

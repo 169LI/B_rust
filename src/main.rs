@@ -9,7 +9,6 @@ use futures::future::join_all;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use rand::Rng;
 use crate::errors::AppError;
 use crate::logger::{log_error, log_stats};
 
@@ -20,66 +19,40 @@ mod logger;//日志记录功能
 /// 配置管理(config结构体)
 #[allow(dead_code)]
 struct Config {
-    concurrency: usize,        // 并发请求数
-    max_db_retries: u32,      // 数据库连接最大重试次数
-    db_retry_interval: u64,   // 数据库重试间隔（秒）
-    request_timeout: u64,     // 请求超时时间（秒）
-    tokens: Vec<String>,      // GitHub Token 列表
-
+    concurrency: usize,  // 并发请求数
+    max_db_retries: u32, // 数据库连接最大重试次数
+    db_retry_interval: u64, // 数据库重试间隔（秒）
+    request_timeout: u64, // 请求超时时间（秒）
+    tokens: Vec<String>, // GitHub Token 列表
+    data_file: String,
+    failed_file: String,
 }
+
 impl Config {
     fn new() -> Self {
         Config {
-            //TODO Problem 需测试.unwrap_or()语法的参数要和上面的result的OK()一样？
-            concurrency: env::var("CONCURRENCY")
-                .unwrap_or_else(|_| {
-                    eprintln!("警告：环境变量 CONCURRENCY 未设置，将使用默认值 50");
-                    "50".to_string()
-                })
-                .parse()
-                .unwrap_or(50),
-            max_db_retries: env::var("MAX_DB_RETRIES")
-                .unwrap_or_else(|_| {
-                    eprintln!("警告：环境变量 MAX_DB_RETRIES 未设置，将使用默认值 5");
-                    "5".to_string()
-                })
-                .parse()
-                .unwrap_or(5),
-            db_retry_interval: env::var("DB_RETRY_INTERVAL")
-                .unwrap_or_else(|_| {
-                    eprintln!("警告：环境变量 DB_RETRY_INTERVAL 未设置，将使用默认值 5");
-                    "5".to_string()
-                })
-                .parse()
-                .unwrap_or(5),
-            request_timeout: env::var("REQUEST_TIMEOUT")
-                .unwrap_or_else(|_| {
-                    eprintln!("警告：环境变量 REQUEST_TIMEOUT 未设置，将使用默认值 5");
-                    "5".to_string()
-                })
-                .parse()
-                .unwrap_or(5),
+            concurrency: env::var("CONCURRENCY").unwrap_or("50".to_string()).parse().unwrap_or(50),
+            max_db_retries: env::var("MAX_DB_RETRIES").unwrap_or("5".to_string()).parse().unwrap_or(5),
+            db_retry_interval: env::var("DB_RETRY_INTERVAL").unwrap_or("5".to_string()).parse().unwrap_or(5),
+            request_timeout: env::var("REQUEST_TIMEOUT").unwrap_or("30".to_string()).parse().unwrap_or(30),
             tokens: vec![
+                // 需要测试5000/小时 是如何计算的？0-10min把Token用完了，10-20会恢复吗
                 env::var("GITHUB_TOKEN_1").expect("GITHUB_TOKEN_1 not set"),
                 env::var("GITHUB_TOKEN_2").expect("GITHUB_TOKEN_2 not set"),
                 env::var("GITHUB_TOKEN_3").expect("GITHUB_TOKEN_3 not set"),
-                //TODO Problem2 对于程序运行中的限速的Token采取什么方式处理 对于17w的数据 给足够的40Token一次性拿？
-                // 需要测试5000/小时 是如何计算的？0-10min把Token用完了，10-20会恢复吗
-                // 如果40Token->程序一小时（3000/分速率  18w/小时数据），直接对于限速的Token直接弃用
-
                 // env::var("GITHUB_TOKEN_4").expect("GITHUB_TOKEN_4 not set"),
                 env::var("GITHUB_TOKEN_5").expect("GITHUB_TOKEN_5 NOT set"),
                 env::var("GITHUB_TOKEN_6").expect("GITHUB_TOKEN_6 NOT set"),
                 env::var("GITHUB_TOKEN_7").expect("GITHUB_TOKEN_7 NOT set"),
                 env::var("GITHUB_TOKEN_8").expect("GITHUB_TOKEN_8 NOT set"),
                 env::var("GITHUB_TOKEN_9").expect("GITHUB_TOKEN_9 NOT set"),
-                env::var("GITHUB_TOKEN_10").expect("GITHUB_TOKEN_10 NOT set"),
-                env::var("GITHUB_TOKEN_11").expect("GITHUB_TOKEN_11 NOT set"),
+                env::var("GITHUB_TOKEN_10").expect("GITHUB_TOKEN_9 NOT set"),
+                env::var("GITHUB_TOKEN_11").expect("GITHUB_TOKEN_9 NOT set"),
             ].into_iter().filter(|t| !t.is_empty()).collect(),
-        }
+            data_file: env::var("DATA_FILE").unwrap_or("repositories.data".to_string()),
+            failed_file: env::var("FAILED_FILE").unwrap_or("failed_repos.data".to_string()),}
     }
 }
-
 ///检查数据格式  返回(owner,name)
 ///
 ///格式http://github.com/owner/name 或https://github.com/owner/name.git
@@ -89,38 +62,42 @@ pub fn validate_repo_format(repo: &str) -> Result<(String, String), AppError> {
     let parts: Vec<&str> = repo.split('/').collect();
     let owner = parts[3].to_string();
     let name_raw = parts[4];
-    if (parts[0]!="https:" && parts[0]!="http:")||parts.len() < 5|| owner.is_empty() || name_raw.is_empty() {
+    if parts.len() < 5 || (parts[0] != "https:" && parts[0] != "http:") || owner.is_empty() || name_raw.is_empty() {
         return Err(AppError::InvalidFormat(format!("无效的仓库格式: {}", repo)));
     }
-    //进一步处理name格式问题
     let name = name_raw.split('.').next().unwrap_or(name_raw).to_string();
     if name.is_empty() {
-        return Err(AppError::InvalidFormat(format!("仓库名称格式错误: {}", repo)));
+        return Err(AppError::InvalidFormat(format!("仓库名称为空: {}", repo)));
     }
     Ok((owner, name))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
-    //初始化日志
+    dotenv().ok();
+    let config = Arc::new(Config::new());
     logger::init_logger();
 
-    //加载配置
-    dotenv().map_err(|e| AppError::ConfigError(format!("无法加载 .env 文件: {}", e)))?;
-    let config = Config::new();
-
-    //共享状态初始化
-    let tokens = Arc::new(config.tokens);
+    let tokens = Arc::new(config.tokens.clone());
+    let token_counter = Arc::new(AtomicUsize::new(0)); // 用于轮询
     let available_tokens = Arc::new(tokio::sync::Mutex::new(tokens.len()));
     let success_count = Arc::new(AtomicUsize::new(0));
     let banned_tokens = Arc::new(tokio::sync::Mutex::new(HashMap::<String, Instant>::new()));
 
-    //数据库初始化 连接、初始化，创建连接池
+    // 初始化 HTTP 客户端
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(config.request_timeout))
+        .pool_max_idle_per_host(config.concurrency)
+        .build()
+        .map_err(|e| AppError::ConfigError(format!("构建 HTTP 客户端失败: {}", e)))?;
+    let client = Arc::new(client);
+
     let mut pg_client = db::connect_postgres().await?;
     db::init_db(&mut pg_client).await?;
     let pool = db::create_pool().await?;
 
-    let repos_content = fs::read_to_string("repositories.data")?;
+    let repos_content = fs::read_to_string(&config.data_file)
+        .map_err(|e| AppError::FileError(format!("无法读取数据文件 {}: {}", config.data_file, e)))?;
     let repos: Vec<String> = repos_content.lines().map(|s| s.to_string()).collect();
 
     let success_count_clone = success_count.clone();
@@ -143,56 +120,78 @@ async fn main() -> Result<(), AppError> {
             Ok((owner, name)) => {
                 let pool = pool.clone();
                 let tokens = tokens.clone();
-                let mut token_index = rand::thread_rng().gen_range(0..tokens.len());
-                let mut token = tokens[token_index].clone();
-                let _permit = semaphore.clone().acquire_owned().await.unwrap();
+                let config = config.clone();
+                let client = client.clone();
+                let token_counter = token_counter.clone();
                 let success_count = success_count.clone();
                 let banned_tokens = banned_tokens.clone();
+
+                let token_index = token_counter.fetch_add(1, Ordering::Relaxed) % tokens.len();//Token轮询机制
+                let token = tokens[token_index].clone();
+                let _permit = semaphore.clone().acquire_owned().await.unwrap();
 
                 handles.push(tokio::spawn(async move {
                     let db_client = pool.get().await.unwrap();
                     let mut retries = 0;
-                    const MAX_RETRIES: usize = 5;
+                    let max_retries = config.max_db_retries as usize;
+                    let mut current_token = token;
 
                     loop {
                         match tokio::time::timeout(
                             Duration::from_secs(config.request_timeout),
-                            fetch_repo_data(&owner, &name, &token),
+                            fetch_repo_data(&client, &owner, &name, &current_token),
                         ).await {
                             Ok(Ok(response)) => {
                                 match db::store_repo_data(&db_client, &owner, &name, response).await {
-                                    Ok(()) => {
+                                    Ok(_) => {
                                         success_count.fetch_add(1, Ordering::Relaxed);
                                         break;
                                     }
                                     Err(e) => {
                                         log_error(&e);
+                                        fs::OpenOptions::new()
+                                            .create(true)
+                                            .append(true)
+                                            .open(&config.failed_file)
+                                            .map_err(|e| AppError::FileError(format!("无法写入失败文件 {}: {}", config.failed_file, e)))?
+                                            .write_all(format!("https://github.com/{}/{}\n", owner, name).as_bytes())?;
                                         return Err(e);
                                     }
                                 }
                             }
                             Ok(Err(e)) => {
                                 log_error(&e);
-                                if retries >= MAX_RETRIES {
-                                    let err = AppError::TokenBanned(format!("Token {} 超出重试次数", token));
+                                if retries >= max_retries {
+                                    let err = AppError::TokenBanned(format!("Token {} 超出重试次数", current_token));
                                     log_error(&err);
-                                    banned_tokens.lock().await.insert(token.clone(), Instant::now());
+                                    banned_tokens.lock().await.insert(current_token.clone(), Instant::now());
+                                    fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(&config.failed_file)
+                                        .map_err(|e| AppError::FileError(format!("无法写入失败文件 {}: {}", config.failed_file, e)))?
+                                        .write_all(format!("https://github.com/{}/{}\n", owner, name).as_bytes())?;
                                     break;
                                 }
                                 if let Some(wait_time) = e.retry_after() {
                                     tokio::time::sleep(Duration::from_secs(wait_time)).await;
-                                    retries += 1;
                                 } else {
-                                    let wait_time = 60 * (1 << retries); // 指数退避
+                                    let wait_time = 60 * (1 << retries);
                                     tokio::time::sleep(Duration::from_secs(wait_time)).await;
-                                    retries += 1;
-                                    token_index = (token_index + 1) % tokens.len();
-                                    token = tokens[token_index].clone();
                                 }
+                                retries += 1;
+                                let next_index = (token_index + retries) % tokens.len();
+                                current_token = tokens[next_index].clone();
                             }
                             Err(_) => {
                                 let err = AppError::TimeoutError("请求超时".to_string());
                                 log_error(&err);
+                                fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(&config.failed_file)
+                                    .map_err(|e| AppError::FileError(format!("无法写入失败文件 {}: {}", config.failed_file, e)))?
+                                    .write_all(format!("https://github.com/{}/{}\n", owner, name).as_bytes())?;
                                 break;
                             }
                         }
@@ -205,8 +204,9 @@ async fn main() -> Result<(), AppError> {
                 fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open("invalid_repos.txt")?
-                    .write_all(format!("{}\n", repo).as_bytes())?;
+                    .open(&config.failed_file)
+                    .map_err(|e| AppError::FileError(format!("无法写入失败文件 {}: {}", config.failed_file, e)))?
+                    .write_all(format!("{} - Error: {}\n", repo, err).as_bytes())?;
             }
         }
     }
@@ -214,12 +214,7 @@ async fn main() -> Result<(), AppError> {
     Ok(())
 }
 
-async fn fetch_repo_data(
-    owner: &str,
-    name: &str,
-    token: &str,
-) -> Result<serde_json::Value, AppError> {
-    let client = reqwest::Client::new();
+async fn fetch_repo_data(client: &reqwest::Client,owner: &str, name: &str, token: &str) -> Result<serde_json::Value, AppError> {
     let query = format!(
         r#"query {{
             repository(owner: "{}", name: "{}") {{
@@ -268,20 +263,17 @@ async fn fetch_repo_data(
 
     if !status.is_success() {
         let text = response.text().await.map_err(|e| AppError::ApiError(format!("响应解析失败: {}", e)))?;
-        return Err(AppError::ApiError(format!(
-            "请求失败，状态码: {}, 响应: {}",
-            status, text
-        )));
+        return Err(AppError::ApiError(format!("请求失败，状态码: {}, 响应: {}", status, text)));
     }
 
     let json = response.json::<serde_json::Value>().await.map_err(|e| AppError::ApiError(format!("JSON解析失败: {}", e)))?;
     if json.get("data").and_then(|d| d.get("repository")).is_none() {
-        return Err(AppError::ApiError(format!(
-            "API响应中没有仓库数据: owner={}, name={}", owner, name
-        )));
+        return Err(AppError::ApiError(format!("API响应中没有仓库数据: owner={}, name={}", owner, name)));
     }
     Ok(json)
 }
+
+
 
 #[cfg(test)]
 mod tests {
@@ -327,25 +319,49 @@ mod tests {
 
     #[test]
     fn test_environment_setup() {
+        // 加载 .env 文件
+        dotenv::dotenv().ok();
+
+        // 检查 .env 文件是否存在
         assert!(
             check_file_exists(".env"),
             "错误: .env 文件不存在，请确保项目根目录下有 .env 文件"
         );
+
+        // 从环境变量中获取 DATA_FILE 和 FAILED_FILE 的值，并提供默认值
+        let data_file = env::var("DATA_FILE").unwrap_or("repositories.data".to_string());
+        let failed_file = env::var("FAILED_FILE").unwrap_or("failed_repos.data".to_string());
+
+        // 检查 DATA_FILE 指定的文件是否存在
         assert!(
-            check_file_exists("repositories.data"),
-            "错误: repositories.data 文件不存在，请确保项目根目录下有 repositories.data 文件"
+            check_file_exists(&data_file),
+            "错误: {} 文件不存在，请确保项目根目录下有该文件",
+            data_file
         );
+
+        // 检查 FAILED_FILE 是否可创建（不要求必须存在，但需要确保目录可写）
+        let failed_dir = Path::new(&failed_file).parent().unwrap_or(Path::new("."));
+        if !failed_dir.exists() {
+            fs::create_dir_all(failed_dir).expect("无法创建 FAILED_FILE 的目录");
+        }
+
+        // 清理日志文件
         clear_log_files("logs").expect("清理日志文件失败");
         println!("环境检查和日志清理完成");
     }
     #[test]
     fn test_all_repos_format() {
-        let repos_content = fs::read_to_string("repositories.data")
-            .expect("无法读取 repositories.data 文件");
+        // 加载 .env 文件
+        dotenv::dotenv().ok();
+
+        // 从环境变量中获取 DATA_FILE 的值，默认值为 "repositories.data"
+        let data_file = env::var("DATA_FILE").unwrap_or("repositories.data".to_string());
+
+        let repos_content = fs::read_to_string(&data_file)
+            .expect(&format!("无法读取 {} 文件", data_file));
         let repos: Vec<String> = repos_content.lines().map(|s| s.trim().to_string()).collect();
 
-        let mut invalid_repos = Vec::new();
-        for repo in repos {
+        let mut invalid_repos = Vec::new();for repo in repos {
             match validate_repo_format(&repo) {
                 Ok(_) => {},
                 Err(err) => {

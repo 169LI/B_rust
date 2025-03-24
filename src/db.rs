@@ -109,12 +109,14 @@ pub async fn create_pool() -> Result<Pool, AppError> {
     Ok(pool)
 }
 
+
+///数据解析并存入数据库
 pub async fn store_repo_data(
     pg_client: &deadpool_postgres::Client,
     owner: &str,
     name: &str,
     response: serde_json::Value,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     if let Some(repo) = response.get("data").and_then(|d| d.get("repository")) {
         let stars = repo["stargazers"]["totalCount"].as_i64().unwrap_or(0);
         let forks = repo["forks"]["totalCount"].as_i64().unwrap_or(0);
@@ -131,13 +133,13 @@ pub async fn store_repo_data(
             SET stars = $3, forks = $4, commits = $5, issues = $6, merged_prs = $7
         "#;
 
-        pg_client
+        let rows_affected =pg_client
             .execute(
                 query,
                 &[&owner, &name, &stars, &forks, &commits, &issues, &merged_prs],
             )
             .await?;
-        Ok(())
+        Ok(rows_affected == 1) // 新插入返回 true，更新返回 false
     } else {
         Err(AppError::ApiError("API响应中没有仓库数据".to_string()))
     }
