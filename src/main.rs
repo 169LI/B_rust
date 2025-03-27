@@ -1,5 +1,6 @@
 
 
+use std::io;
 use std::env;
 use std::fs;
 use std::io::{Write};
@@ -94,9 +95,10 @@ async fn main() -> Result<(), AppError> {
     let config = Arc::new(Config::new());
     logger::init_logger();
 
-    let tokens = Arc::new(config.tokens.clone());
+    let initial_tokens = config.tokens.clone(); // 初始 token 列表
+
     let token_counter = Arc::new(AtomicUsize::new(0)); // 用于轮询
-    let available_tokens = Arc::new(tokio::sync::Mutex::new(tokens.len()));
+    let available_tokens = Arc::new(tokio::sync::Mutex::new(initial_tokens.len()));
     let success_count = Arc::new(AtomicUsize::new(0));
     let banned_tokens = Arc::new(tokio::sync::Mutex::new(HashMap::<String, Instant>::new()));
 
@@ -107,6 +109,16 @@ async fn main() -> Result<(), AppError> {
         .build()
         .map_err(|e| AppError::ConfigError(format!("构建 HTTP 客户端失败: {}", e)))?;
     let client = Arc::new(client);
+
+    // 测试所有 token 并获取有效 token 列表
+    println!("开始测试 token 有效性...");
+    let valid_tokens = test_tokens(&client, &initial_tokens, &banned_tokens).await?;
+    if valid_tokens.is_empty() {
+        return Err(AppError::ConfigError("没有有效的 token，无法继续".to_string()));
+    }
+    let tokens = Arc::new(valid_tokens); // 更新全局 tokens 为有效 token
+    *available_tokens.lock().await = tokens.len(); // 更新可用 token 数量
+
 
     let mut pg_client = db::connect_postgres().await?;
     db::init_db(&mut pg_client).await?;
@@ -142,10 +154,13 @@ async fn main() -> Result<(), AppError> {
                 let token_counter = token_counter.clone();
                 let success_count = success_count.clone();
                 let banned_tokens = banned_tokens.clone();
-
+                let available_tokens = available_tokens.clone(); // 关键改动：克隆 Arc
                 let token_index = token_counter.fetch_add(1, Ordering::Relaxed) % tokens.len();//Token轮询机制
                 let token = tokens[token_index].clone();
                 let _permit = semaphore.clone().acquire_owned().await.unwrap();
+
+                let mut db_retries = 0;
+                let max_db_retries = config.max_db_retries as usize; // 重用 Config 中的 max_db_retries
 
                 handles.push(tokio::spawn(async move {
                     let db_client = pool.get().await.unwrap();
@@ -154,53 +169,70 @@ async fn main() -> Result<(), AppError> {
                     let mut current_token = token;
 
                     loop {
-                        match tokio::time::timeout(
-                            Duration::from_secs(config.request_timeout),
-                            fetch_repo_data(&client, &owner, &name, &current_token),
-                        ).await {
+                        match tokio::time::timeout(Duration::from_secs(config.request_timeout), fetch_repo_data(&client, &owner, &name, &current_token), ).await {
                             Ok(Ok(response)) => {
-                                match db::store_repo_data(&db_client, &cratesname,&owner, &name, response).await {
-                                    Ok(_) => {
-                                        success_count.fetch_add(1, Ordering::Relaxed);
-                                        break;
+                                loop {
+                                    match db::store_repo_data(&db_client, &cratesname, &owner, &name, response.clone()).await {
+                                        Ok(_) => {
+                                            success_count.fetch_add(1, Ordering::Relaxed);
+                                            break; // 成功写入数据库，退出数据库写入循环
+                                        }
+                                        Err(e) => {
+                                            log_error(&e);
+                                            if db_retries >= max_db_retries {
+                                                // 重试次数用尽，记录此条数据失败并退出
+                                                fs::OpenOptions::new()
+                                                    .create(true)
+                                                    .append(true)
+                                                    .open("write_failed")
+                                                    .map_err(|e| AppError::FileError(format!("写入失败 write_failed: {}", e)))?
+                                                    .write_all(format!("{},https://github.com/{}/{}\n", cratesname, owner, name).as_bytes())?;
+                                                return Err(e); // 5次写也写不进去，不写了，直接退出本次tokio::spawn
+                                            }
+                                            db_retries += 1; // 立即重试，也可以加一个间隔
+                                        }
                                     }
-                                    Err(e) => {
-                                        log_error(&e);
+                                }
+                                break;//退出本次任务，本分支的tokio::spawn结束，不然又重新请求本条数据了
+                            }
+                            Ok(Err(e)) => {
+                                log_error(&e);
+                                let is_token_banned = matches!(e, AppError::TokenBanned(_));//否匹配 AppError::TokenBanned 变体
+                                // 如果是 TokenBanned 或重试次数用尽，禁用当前 token
+                                if is_token_banned || retries >= max_retries {
+                                    let err_msg = if is_token_banned {
+                                        e.to_string() // 直接用 TokenBanned 的消息
+                                    } else {
+                                        format!("Token {} 超出重试次数", current_token)
+                                    };
+                                    let err = AppError::TokenBanned(err_msg);
+                                    log_error(&err);
+                                    banned_tokens.lock().await.insert(current_token.clone(), Instant::now());
+                                    *available_tokens.lock().await -= 1;
+                                    // 检查是否还有可用 token
+                                    if retries >= tokens.len() - 1 { // 如果所有 token 都试过了
+                                        let err = AppError::TokenBanned("所有 token 均已耗尽".to_string());
+                                        log_error(&err);
                                         fs::OpenOptions::new()
                                             .create(true)
                                             .append(true)
                                             .open("write_failed")
-                                            .map_err(|e| AppError::FileError(format!("无法写入失败文件write_failed: {}", e)))?
-                                            .write_all(format!("{},https://github.com/{}/{}\n",cratesname, owner, name).as_bytes())?;
-                                        return Err(e);
+                                            .map_err(|e| AppError::FileError(format!("无法写入失败文件 write_failed: {}", e)))?
+                                            .write_all(format!("{},https://github.com/{}/{}\n", cratesname, owner, name).as_bytes())?;
+                                        break;
                                     }
                                 }
-                            }
-                            Ok(Err(e)) => {
-                                log_error(&e);
-                                if retries >= max_retries {
-                                    let err = AppError::TokenBanned(format!("Token {} 超出重试次数", current_token));
-                                    log_error(&err);
-                                    banned_tokens.lock().await.insert(current_token.clone(), Instant::now());
-                                    fs::OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open("write_failed")
-                                        .map_err(|e| AppError::FileError(format!("无法写入失败文件 write_failed: {}", e)))?
-                                        .write_all(format!("{},https://github.com/{}/{}\n",cratesname, owner, name).as_bytes())?;
-                                    break;
+                                // 如果不是立即禁用，固定等待 2 秒
+                                if !is_token_banned {
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
                                 }
-                                if let Some(wait_time) = e.retry_after() {
-                                    tokio::time::sleep(Duration::from_secs(wait_time)).await;
-                                } else {
-                                    let wait_time = 60 * (1 << retries);
-                                    tokio::time::sleep(Duration::from_secs(wait_time)).await;
-                                }
+                                // 切换到下一个 token
                                 retries += 1;
                                 let next_index = (token_index + retries) % tokens.len();
                                 current_token = tokens[next_index].clone();
                             }
                             Err(_) => {
+                                println!("请求超时 401触发了？？");
                                 let err = AppError::TimeoutError("请求超时".to_string());
                                 log_error(&err);
                                 fs::OpenOptions::new()
@@ -222,7 +254,7 @@ async fn main() -> Result<(), AppError> {
                 fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(&config.failed_file)
+                    .open(&config.failed_file)//此处是由于格式不规范引起的问题，不经过处理无法，再次重试也是报错 需要另存信息
                     .map_err(|e| AppError::FileError(format!("无法写入失败文件 {}: {}", config.failed_file, e)))?
                     .write_all(format!("{}\n", repo).as_bytes())?;
             }
@@ -262,35 +294,119 @@ async fn fetch_repo_data(client: &reqwest::Client,owner: &str, name: &str, token
         .map_err(|e| AppError::ApiError(format!("请求发送失败: {}", e)))?;
 
     let status = response.status();
-    if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let headers = response.headers();
-        let remaining = headers.get("x-ratelimit-remaining").and_then(|v| v.to_str().ok().and_then(|s| s.parse::<i32>().ok()));
-        let retry_after = headers.get("retry-after").and_then(|v| v.to_str().ok().and_then(|s| s.parse::<u64>().ok()));
-        let reset_at = headers.get("x-ratelimit-reset").and_then(|v| v.to_str().ok().and_then(|s| s.parse::<u64>().ok()));
 
-        if let Some(seconds) = retry_after {
-            return Err(AppError::ApiError(format!("速率限制，需等待 {} 秒", seconds)));
-        } else if let (Some(0), Some(reset_at)) = (remaining, reset_at) {
-            let now = Instant::now().elapsed().as_secs();
-            let wait_time = reset_at.saturating_sub(now);
-            return Err(AppError::ApiError(format!("主要速率限制，需等待 {} 秒", wait_time)));
-        } else {
-            return Err(AppError::ApiError("次要速率限制，需指数退避".to_string()));
-        }
-    }
 
-    if !status.is_success() {
+    if !status.is_success() {//200 Ok 不会进入
         let text = response.text().await.map_err(|e| AppError::ApiError(format!("响应解析失败: {}", e)))?;
+        println!("请求失败，状态码: {}, 响应: {}", status, text);
         return Err(AppError::ApiError(format!("请求失败，状态码: {}, 响应: {}", status, text)));
     }
 
     let json = response.json::<serde_json::Value>().await.map_err(|e| AppError::ApiError(format!("JSON解析失败: {}", e)))?;
+    // 检查 RATE_LIMITED
+    if let Some(errors) = json.get("errors").and_then(|e| e.as_array()) {
+        for error in errors {
+            if let Some(error_type) = error.get("type").and_then(|t| t.as_str()) {
+                if error_type == "RATE_LIMITED" {
+                    return Err(AppError::TokenBanned(format!("Token {} 已达速率限制", token)));
+                }
+            }
+        }
+    }
+
     if json.get("data").and_then(|d| d.get("repository")).is_none() {
         return Err(AppError::ApiError(format!("API响应中没有仓库数据: owner={}, name={}", owner, name)));
     }
     Ok(json)
 }
+/// 测试所有 token 的有效性，返回有效的 token 数量
+async fn test_tokens(
+    client: &reqwest::Client,
+    tokens: &[String],
+    banned_tokens: &tokio::sync::Mutex<HashMap<String, Instant>>,
+) -> Result<Vec<String>, AppError> {
+    let mut valid_tokens = Vec::new();
+    let mut total_remaining = 0;
+    for token in tokens {
+        let query = r#"query {
+            rateLimit {
+                limit
+                remaining
+                used
+            }
+        }"#;
 
+        let response = client
+            .post("https://api.github.com/graphql")
+            .header("User-Agent", "get-data-test")
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "query": query }))
+            .send()
+            .await
+            .map_err(|e| AppError::ApiError(format!("测试 token {} 失败: {}", token, e)))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            println!("Token {} 无效，状态码: {}", token, status);
+            banned_tokens.lock().await.insert(token.clone(), Instant::now());
+            continue;
+        }
+
+        let json = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| AppError::ApiError(format!("解析 token {} 响应失败: {}", token, e)))?;
+
+        // 检查 rateLimit 数据
+        if let Some(rate_limit) = json.get("data").and_then(|d| d.get("rateLimit")) {
+            let remaining = rate_limit
+                .get("remaining")
+                .and_then(|r| r.as_u64())
+                .unwrap_or(0);
+            let limit = rate_limit
+                .get("limit")
+                .and_then(|l| l.as_u64())
+                .unwrap_or(0);
+            println!(
+                "Token {}: 限制={}, 剩余={}",
+                token, limit, remaining
+            );
+            if remaining > 0 {
+                valid_tokens.push(token.clone());
+                total_remaining += remaining; // 累加剩余请求次数
+            } else {
+                banned_tokens.lock().await.insert(token.clone(), Instant::now());
+            }
+        } else if let Some(errors) = json.get("errors") {
+            println!("Token {} 查询失败: {:?}", token, errors);
+            banned_tokens.lock().await.insert(token.clone(), Instant::now());
+        } else {
+            println!("Token {} 返回意外响应: {:?}", token, json);
+            banned_tokens.lock().await.insert(token.clone(), Instant::now());
+        }
+    }
+
+    println!("有效 token 数量: {}, 总剩余请求次数: {}", valid_tokens.len(), total_remaining);
+
+    // 检查总请求次数并提示用户
+    if total_remaining > 40000 {
+        println!(
+            "警告：所有 token 的总剩余请求次数为 {}，超过 40000，是否继续运行？(y/n)",
+            total_remaining
+        );
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| AppError::ConfigError(format!("读取用户输入失败: {}", e)))?;
+        let input = input.trim().to_lowercase();
+        if input != "y" && input != "yes" {
+            println!("用户选择不继续，返回空 token 列表");
+            return Ok(Vec::new()); // 返回空列表，表示不继续
+        }
+        println!("用户确认继续运行");
+    }
+    Ok(valid_tokens)
+}
 
 #[cfg(test)]
 mod tests {
@@ -300,6 +416,8 @@ mod tests {
     use std::path::Path;
     use tokio_postgres::NoTls;
     use crate::split::split_file;
+    //ToDo 需要添加测试，检查Token有效性
+
     #[test]
     fn test_split_data() -> Result<(), io::Error> {
         let input_file = "crates_with_address.data";

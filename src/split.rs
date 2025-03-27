@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write}; // 添加 BufReader
 use std::path::Path;
-
+#[allow(dead_code)]
 pub fn split_file(input_path: &str, lines_per_file: usize) -> Result<(), io::Error> {
     let file = File::open(input_path)?;
     let reader = BufReader::new(file);
