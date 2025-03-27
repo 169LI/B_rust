@@ -417,6 +417,7 @@ dependencies = [
  "deadpool-postgres",
  "dotenv",
  "futures",
+ "log",
  "once_cell",
  "rand 0.8.5",
  "reqwest",
