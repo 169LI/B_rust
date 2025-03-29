@@ -232,7 +232,7 @@ async fn main() -> Result<(), AppError> {
                                 current_token = tokens[next_index].clone();
                             }
                             Err(_) => {
-                                println!("请求超时 401触发了？？");
+                                // println!("请求超时 401触发了？？");
                                 let err = AppError::TimeoutError("请求超时".to_string());
                                 log_error(&err);
                                 fs::OpenOptions::new()
@@ -389,9 +389,9 @@ async fn test_tokens(
     println!("有效 token 数量: {}, 总剩余请求次数: {}", valid_tokens.len(), total_remaining);
 
     // 检查总请求次数并提示用户
-    if total_remaining > 40000 {
+    if total_remaining < 40000 {
         println!(
-            "警告：所有 token 的总剩余请求次数为 {}，超过 40000，是否继续运行？(y/n)",
+            "警告：所有 token 的总剩余请求次数为 {}，不足 40000，是否继续运行？(y/n)",
             total_remaining
         );
         let mut input = String::new();
